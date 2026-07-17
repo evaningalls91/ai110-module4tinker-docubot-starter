@@ -11,6 +11,23 @@ import os
 import glob
 import re
 
+# Common English "filler" words that carry no topic meaning. We ignore these when
+# scoring so that a document doesn't look relevant just because it shares words
+# like "the" or "to" with the question. This list is deliberately short — add or
+# remove words here to tinker with how strict retrieval is.
+STOPWORDS = {
+    "a", "an", "the", "and", "or", "but", "if", "of", "to", "in", "on", "at",
+    "for", "with", "by", "from", "is", "are", "was", "were", "be", "been",
+    "do", "does", "did", "how", "what", "where", "which", "who", "when", "why",
+    "i", "you", "it", "this", "that", "these", "those", "there", "here",
+    "any", "all", "can", "could", "should", "would", "my", "me", "we", "us",
+    # Meta words that describe the question itself rather than its topic, e.g.
+    # "is there any MENTION of X in these DOCS". Without these, a question about
+    # a missing topic still matches any file just for containing "docs".
+    "mention", "mentioned", "doc", "docs", "documentation", "about",
+}
+
+
 class DocuBot:
     def __init__(self, docs_folder="docs", llm_client=None):
         """
@@ -131,19 +148,86 @@ class DocuBot:
         """
         # set(...) gives us the UNIQUE words in the query. We only care whether
         # a query word appears in the doc, not how many times it was typed.
-        query_words = set(self._tokenize(query))
+        #
+        # Subtracting STOPWORDS is the key filtering step: it drops filler words
+        # like "how", "do", "i", "to", "the" from the query before matching. Now
+        # a document only scores points for MEANINGFUL words it shares with the
+        # question. A doc that only overlapped on filler words used to score 1+
+        # (and sneak past the score > 0 filter in retrieve); now it scores 0 and
+        # gets dropped.
+        query_words = set(self._tokenize(query)) - STOPWORDS
         text_words = set(self._tokenize(text))
 
         # The & operator is set intersection: the words present in BOTH the
         # query and the document. len(...) counts them -> that's the score.
         return len(query_words & text_words)
 
-        # Tinker ideas (things you could try to improve ranking):
+        # Further tinker ideas:
         # - Count total occurrences instead of presence (weights repeated words).
-        # - Remove stopwords like "the", "do", "i", "to" so common filler words
-        #   don't inflate the score. Right now "How do I connect to the database"
-        #   gives free points to any doc containing "to" or "the".
         # - Divide by document length so short, focused docs aren't penalized.
+
+    def _best_excerpt(self, query, text, max_chars=600):
+        """
+        Return the most relevant portion of `text` for `query`, instead of the
+        whole document. This keeps both the printed snippets and the context we
+        send to the LLM short and focused.
+
+        Strategy: slide a CONTIGUOUS window of paragraphs across the document and
+        keep the window that covers the most DISTINCT query words (within the
+        character budget). Two design choices matter here:
+
+        - Contiguous, not scattered: markdown breaks an answer into tiny pieces
+          (a "### POST /api/refresh" heading, then its description, then a code
+          block). Picking individual high-scoring paragraphs can grab three
+          unrelated lines and miss the actual answer. A window keeps a heading
+          together with the text underneath it.
+        - Distinct-word coverage, not raw count: counting every match lets a
+          common word like "token" dominate, so a section repeating "access
+          token" beats the one section that actually mentions the rare, decisive
+          word "refresh". Rewarding DISTINCT words favors the region that covers
+          the most of the question.
+        """
+        # Only meaningful query words matter (same stopword rule as scoring).
+        query_words = set(self._tokenize(query)) - STOPWORDS
+
+        # Split on blank lines into paragraphs; drop the empties the split leaves.
+        paragraphs = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
+
+        # Defensive fallbacks: nothing to search on, or no paragraph structure.
+        if not query_words or not paragraphs:
+            return text[:max_chars]
+
+        # Pre-compute, for each paragraph, which query words it contains. Doing
+        # this once avoids re-tokenizing inside the nested loop below.
+        para_hits = [set(self._tokenize(p)) & query_words for p in paragraphs]
+
+        best_words = -1          # most distinct query words covered so far
+        best_excerpt = paragraphs[0][:max_chars]  # sensible default
+
+        # Try a window starting at each paragraph...
+        for start in range(len(paragraphs)):
+            window = []
+            length = 0
+            covered = set()
+
+            # ...growing it downward until we would exceed the character budget.
+            for j in range(start, len(paragraphs)):
+                para = paragraphs[j]
+                # Always allow at least the first paragraph even if it's long.
+                if window and length + len(para) > max_chars:
+                    break
+                window.append(para)
+                length += len(para)
+                covered |= para_hits[j]
+
+            # Keep this window if it covers strictly more distinct query words
+            # than the best one we've seen. ">" (not ">=") biases toward earlier,
+            # higher-in-the-doc windows on ties, which tend to be introductions.
+            if len(covered) > best_words:
+                best_words = len(covered)
+                best_excerpt = "\n\n".join(window)
+
+        return best_excerpt
 
     def retrieve(self, query, top_k=3):
         """
@@ -171,10 +255,16 @@ class DocuBot:
         # (the first element of each tuple); reverse=True puts the highest first.
         scored.sort(key=lambda item: item[0], reverse=True)
 
-        # Rebuild the (filename, text) shape the callers expect, dropping the
-        # score, and keep only the best top_k.
-        results = [(filename, text) for _, filename, text in scored]
-        return results[:top_k]
+        # Keep only the best top_k, then trim each document down to the most
+        # relevant excerpt instead of returning the whole file. Note we ranked
+        # on the FULL-document score above (more reliable), but hand back a short
+        # snippet so both the printed output and the RAG prompt stay focused.
+        top = scored[:top_k]
+        results = [
+            (filename, self._best_excerpt(query, text))
+            for _, filename, text in top
+        ]
+        return results
 
     # -----------------------------------------------------------
     # Answering Modes
