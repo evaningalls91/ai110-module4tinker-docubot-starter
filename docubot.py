@@ -9,6 +9,7 @@ Core DocuBot class responsible for:
 
 import os
 import glob
+import re
 
 class DocuBot:
     def __init__(self, docs_folder="docs", llm_client=None):
@@ -16,6 +17,15 @@ class DocuBot:
         docs_folder: directory containing project documentation files
         llm_client: optional Gemini client for LLM based answers
         """
+        # If docs_folder is a relative path like "docs", resolve it relative to
+        # THIS file's location rather than the terminal's current working
+        # directory. Otherwise running `python main.py` from a parent folder
+        # would look for docs/ in the wrong place, load zero documents, and make
+        # retrieval silently return "I do not know" for every query.
+        if not os.path.isabs(docs_folder):
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            docs_folder = os.path.join(script_dir, docs_folder)
+
         self.docs_folder = docs_folder
         self.llm_client = llm_client
 
@@ -45,14 +55,40 @@ class DocuBot:
         return docs
 
     # -----------------------------------------------------------
+    # Tokenizer (shared helper used by indexing, scoring, retrieval)
+    # -----------------------------------------------------------
+
+    def _tokenize(self, text):
+        """
+        Turn a chunk of text into a clean list of lowercase words.
+
+        We do this in one place so that indexing, scoring, and retrieval all
+        agree on what counts as a "word". If they disagreed, "token." in a doc
+        might not match "token" in a query and retrieval would silently miss
+        hits.
+
+        Steps:
+        1. Lowercase everything so "Token" and "token" are treated the same.
+        2. Replace every run of non-alphanumeric characters (spaces, periods,
+           slashes, angle brackets, etc.) with a single space. This strips
+           punctuation like "database?" -> "database" and splits "/api/login"
+           into "api" and "login".
+        3. Split on whitespace into individual words.
+        """
+        text = text.lower()
+        # \w matches letters, digits, and underscore; [^\w] is everything else.
+        # Turning punctuation into spaces lets str.split() do the rest.
+        text = re.sub(r"[^\w]+", " ", text)
+        return text.split()
+
+    # -----------------------------------------------------------
     # Index Construction (Phase 1)
     # -----------------------------------------------------------
 
     def build_index(self, documents):
         """
-        TODO (Phase 1):
-        Build a tiny inverted index mapping lowercase words to the documents
-        they appear in.
+        Build a tiny inverted index: a dict mapping each lowercase word to the
+        list of filenames that contain it.
 
         Example structure:
         {
@@ -60,11 +96,26 @@ class DocuBot:
             "database": ["DATABASE.md"]
         }
 
-        Keep this simple: split on whitespace, lowercase tokens,
-        ignore punctuation if needed.
+        An "inverted" index flips the natural direction (doc -> words) into
+        (word -> docs), which is how real search engines answer "which
+        documents mention X?" quickly. For this small activity the scoring
+        below doesn't strictly need the index, but building it is the point of
+        the exercise.
         """
         index = {}
-        # TODO: implement simple indexing
+
+        # documents is a list of (filename, text) tuples produced by
+        # load_documents().
+        for filename, text in documents:
+            # Use a set so each word in this doc is counted once. Without this,
+            # a word appearing 5 times would append the filename 5 times.
+            words_in_doc = set(self._tokenize(text))
+
+            for word in words_in_doc:
+                # dict.setdefault gives us the existing list for this word, or
+                # creates a new empty list the first time we see the word.
+                index.setdefault(word, []).append(filename)
+
         return index
 
     # -----------------------------------------------------------
@@ -73,26 +124,56 @@ class DocuBot:
 
     def score_document(self, query, text):
         """
-        TODO (Phase 1):
-        Return a simple relevance score for how well the text matches the query.
+        Return a simple relevance score for how well `text` matches `query`.
 
-        Suggested baseline:
-        - Convert query into lowercase words
-        - Count how many appear in the text
-        - Return the count as the score
+        Baseline used here: count how many distinct query words appear anywhere
+        in the document. More overlapping words -> higher score.
         """
-        # TODO: implement scoring
-        return 0
+        # set(...) gives us the UNIQUE words in the query. We only care whether
+        # a query word appears in the doc, not how many times it was typed.
+        query_words = set(self._tokenize(query))
+        text_words = set(self._tokenize(text))
+
+        # The & operator is set intersection: the words present in BOTH the
+        # query and the document. len(...) counts them -> that's the score.
+        return len(query_words & text_words)
+
+        # Tinker ideas (things you could try to improve ranking):
+        # - Count total occurrences instead of presence (weights repeated words).
+        # - Remove stopwords like "the", "do", "i", "to" so common filler words
+        #   don't inflate the score. Right now "How do I connect to the database"
+        #   gives free points to any doc containing "to" or "the".
+        # - Divide by document length so short, focused docs aren't penalized.
 
     def retrieve(self, query, top_k=3):
         """
-        TODO (Phase 1):
-        Use the index and scoring function to select top_k relevant document snippets.
+        Select the top_k most relevant documents for `query`.
 
-        Return a list of (filename, text) sorted by score descending.
+        Returns a list of (filename, text) tuples sorted by score, best first.
+        This is the method the rest of the app relies on (answer_retrieval_only
+        and answer_rag both call it), so its output shape matters.
         """
-        results = []
-        # TODO: implement retrieval logic
+        scored = []
+
+        # Score every document we loaded. self.documents is the list of
+        # (filename, text) tuples built in __init__.
+        for filename, text in self.documents:
+            score = self.score_document(query, text)
+
+            # Skip documents with zero matching words. Keeping them would let
+            # irrelevant files leak into the answer; dropping them lets the bot
+            # honestly say "I do not know" when nothing matches, which is what
+            # the RAG refusal prompt in llm_client.py expects.
+            if score > 0:
+                scored.append((score, filename, text))
+
+        # Sort by score descending. key=lambda item: item[0] sorts on the score
+        # (the first element of each tuple); reverse=True puts the highest first.
+        scored.sort(key=lambda item: item[0], reverse=True)
+
+        # Rebuild the (filename, text) shape the callers expect, dropping the
+        # score, and keep only the best top_k.
+        results = [(filename, text) for _, filename, text in scored]
         return results[:top_k]
 
     # -----------------------------------------------------------
